@@ -162,8 +162,12 @@ class BrowserManager:
 
     async def close(self):
         """Tarayıcıyı kapat."""
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        console.print("[dim]🔒 Tarayıcı kapatıldı.[/]")
+        try:
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+            console.print("[dim]🔒 Tarayıcı kapatıldı.[/]")
+        except Exception:
+            # Kapanış sırasındaki "Connection closed" hataları önemsizdir, gizle.
+            pass

@@ -4,7 +4,6 @@ Seeking Alpha'ya email/şifre ile giriş yapar.
 Captcha çıkarsa kullanıcıyı bilgilendirir ve manuel çözüm bekler.
 """
 import asyncio
-import asyncio
 import os
 from typing import TYPE_CHECKING
 from playwright.async_api import Page
@@ -18,52 +17,77 @@ import config
 console = Console()
 
 
+
 async def is_logged_in(page: Page) -> bool:
-    """Kullanıcının giriş yapıp yapmadığını kontrol eder."""
+    """
+    Sayfada aktif bir oturum olup olmadığını kontrol eder.
+    Negatif (Log in butonu) ve Pozitif (Çerezler/Avatar) göstergeleri birlikte değerlendirir.
+    """
     try:
-        # Ana sayfaya git ve kontrol et
-        await page.goto(config.BASE_URL, wait_until="load",
-                        timeout=config.PAGE_LOAD_TIMEOUT)
-        await page.wait_for_timeout(4000)
+        # Sayfanın dinamik içeriklerinin yüklenmesi için kısa bir bekleme
+        await page.wait_for_timeout(2000)
 
-        # Giriş yapmış kullanıcının profil/avatar ikonunu ara
-        # Seeking Alpha genelde üst menüde kullanıcı avatarı gösterir
-        logged_in_indicators = [
-            '[data-test-id="user-nav-button"]',
-            '[data-test-id="user-menu"]',
-            'a[href="/account/portfolio"]',
-            '.user-avatar',
-            '#user-nav',
+        # 1. NEGATİF KONTROL (Eğer "LOG IN" butonu varsa kesinlikle giriş yapılmamıştır)
+        # Seeking Alpha'nın top-nav barındaki kesin selectorler:
+        logout_indicators = [
+            "button[aria-label='Login / Register']",
+            "button[aria-label='Register']",
+            'header button:has-text("Log in")',
+            'header button:has-text("Create free account")',
+            '[data-test-id="login-button"]',
         ]
+        
+        for selector in logout_indicators:
+            try:
+                el = await page.query_selector(selector)
+                if el and await el.is_visible():
+                    # console.print(f"[dim]   (Debug: Logout butonu bulundu: {selector})[/]")
+                    return False
+            except:
+                continue
 
+        # 2. ÇEREZ KONTROLÜ (En kesin teknik kanıt)
+        # user_id çerezi giriş yapınca gelir, çıkış yapınca silinir.
+        try:
+            cookies = await page.context.cookies()
+            has_user_cookie = any(c['name'] == 'user_id' and c['value'] != '' for c in cookies)
+            if not has_user_cookie:
+                # console.print("[dim]   (Debug: user_id çerezi bulunamadı)[/]")
+                return False
+        except:
+            pass
+
+        # 3. POZİTİF GÖRSEL GÖSTERGELER
+        logged_in_indicators = [
+            '[data-test-id="user-menu-button"]',
+            '[data-test-id="user-avatar"]',
+            'button:has-text("Sign Out")',
+            'a:has-text("Sign Out")',
+            'span:has-text("Your Membership")',
+        ]
         for selector in logged_in_indicators:
             try:
-                element = await page.query_selector(selector)
-                if element:
+                el = await page.query_selector(selector)
+                if el and await el.is_visible():
                     return True
-            except Exception:
+            except:
                 continue
 
-        # Login butonu varsa giriş yapılmamış demektir
-        login_indicators = [
-            'a[href="/account/login"]',
-            'a[href="/login"]',
-            'button:has-text("Sign in")',
-            'a:has-text("Sign in")',
-        ]
+        # 4. JS FLAG KONTROLÜ
+        try:
+            is_logged_in_js = await page.evaluate("() => window.isUserLoggedIn === true || (window.currentUser && !!window.currentUser.id)")
+            if is_logged_in_js:
+                return True
+        except:
+            pass
 
-        for selector in login_indicators:
-            try:
-                element = await page.query_selector(selector)
-                if element and await element.is_visible():
-                    return False
-            except Exception:
-                continue
-
+        # Hiçbir pozitif gösterge yoksa giriş yapılmamış sayılır
         return False
-
     except Exception as e:
-        console.print(f"[yellow]⚠️  Giriş durumu kontrol edilemedi: {e}[/]")
+        console.print(f"[dim]   Oturum durum kontrolü hatası: {e}[/]")
+        return False
+    except Exception as e:
+        console.print(f"[dim]   Oturum durum kontrolü hatası: {e}[/]")
         return False
 
 
@@ -84,22 +108,35 @@ async def check_and_solve_captcha(page: Page, max_retries: int = 3) -> bool:
         '#challenge-container',
         'text="enable Javascript and cookies"',
         'text="Press and Hold"',
+        'iframe[src*="captcha"]',
+        'iframe[title*="captcha" i]',
+        'h1:has-text("Verify")',
+        'h1:has-text("Human")',
     ]
     
     challenge_found = False
-    for indicator in challenge_indicators:
-        try:
-            el = await page.query_selector(indicator)
-            if el and await el.is_visible():
-                challenge_found = True
-                break
-        except:
-            continue
-            
+    found_indicator = ""
+    
+    # Tüm frameleri (iframeler dahil) kontrol et
+    all_frames = page.frames
+    for frame in all_frames:
+        for indicator in challenge_indicators:
+            try:
+                el = await frame.query_selector(indicator)
+                if el and await el.is_visible():
+                    challenge_found = True
+                    found_indicator = indicator
+                    # Debug için screenshot al
+                    await page.screenshot(path="captcha_trace.png")
+                    break
+            except:
+                continue
+        if challenge_found: break
+
     if not challenge_found:
         return False
 
-    console.print("[bold red]🛑 BOT SORGUSU TESPİT EDİLDİ![/]")
+    console.print(f"[bold red]🛑 BOT SORGUSU TESPİT EDİLDİ! ({found_indicator})[/]")
     
     for attempt in range(max_retries):
         await simulate_keyboard_press_and_hold(page, tab_count=attempt+1)
@@ -186,19 +223,22 @@ async def login(page: Page, bm) -> bool:
     # Çerezleri yüklemeyi dene
     await bm.load_cookies()
     
-    # Ana sayfaya git ve kontrol et
+    # Korumalı bir sayfaya gitmeyi dene (Daha kesin sonuç verir)
     try:
-        await page.goto(config.BASE_URL, wait_until="load", timeout=config.PAGE_LOAD_TIMEOUT)
+        test_url = f"{config.BASE_URL}/account/user_settings"
+        console.print(f"[dim]   ⏳ Giriş durumu test ediliyor ({test_url})...[/]")
+        
+        await page.goto(test_url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT)
         await page.wait_for_timeout(3000)
         
         # Captcha çıkarsa çöz
         await check_and_solve_captcha(page)
         
         if await is_logged_in(page):
-            console.print("[bold green]✅ Aktif oturum bulundu. Giriş aşaması atlanıyor.[/]")
+            console.print("[bold green]✅ Aktif oturum doğrulandı. Kazımaya geçiliyor.[/]")
             return True
             
-        console.print("[yellow]⚠️  Aktif oturum bulunamadı. Giriş yapılıyor...[/]")
+        console.print("[yellow]⚠️  Aktif oturum geçerli değil. Giriş yapılıyor...[/]")
         
     except Exception as e:
         console.print(f"[dim]   Oturum kontrolünde hata (pas geçiliyor): {e}[/]")
@@ -212,17 +252,21 @@ async def login(page: Page, bm) -> bool:
                         timeout=config.PAGE_LOAD_TIMEOUT)
         # ─── Email alanını bul ve doldur ───────────────────────
         email_selectors = [
+            'label:has-text("Email") input',
             'input[type="email"]',
             'input[name="email"]',
             '#email',
-            'input[placeholder*="email" i]',
+            'input.V4evW',
         ]
 
         # ─── Login Formunu Bekle (Cloudflare vb. için) ──────────
         console.print("[dim]   ⏳ Login formu bekleniyor...[/]")
         email_input = None
-        # Çok uzun bekle (300 saniye/5 dakika), kullanıcının captcha çözmesine izin ver
         for i in range(300):
+            # Loop heartbeat (her 10 denemede bir log at)
+            if i > 0 and i % 10 == 0:
+                console.print(f"[dim]      ({i}/300) Form aranıyor...[/]")
+
             # Email alanını bulmayı dene
             for selector in email_selectors:
                 try:
@@ -258,10 +302,10 @@ async def login(page: Page, bm) -> bool:
 
         # ─── Şifre alanını bul ve doldur ──────────────────────
         password_selectors = [
+            'input#signInPasswordField',
             '#signInPasswordField',
             'input[name="password"]',
             'input[type="password"]',
-            '#password',
         ]
 
         password_input = None
@@ -284,33 +328,31 @@ async def login(page: Page, bm) -> bool:
 
         console.print("[dim]   🔑 Şifre girildi[/]")
 
-        # ─── Giriş butonuna tıkla ─────────────────────────────
+        # ─── Giriş Butonuna Tıkla ───────────────────────────
+        # "Sign in with Google" butonuna basmamak için kesin selector kullanıyoruz
         submit_selectors = [
             'button[type="submit"]',
+            'button[data-test-id="sign-in-button"]',
             'button:text-is("Sign in")',
             'button:text-is("Sign In")',
-            'button:has-text("Sign in")',
-            'button:has-text("Sign In")',
-            'button:has-text("Log In")',
-            'input[type="submit"]',
         ]
-
-        submit_btn = None
+        
+        login_button = None
         for selector in submit_selectors:
             try:
-                submit_btn = await page.query_selector(selector)
-                if submit_btn:
+                login_button = await page.query_selector(selector)
+                if login_button:
                     break
             except Exception:
                 continue
-
-        if submit_btn:
-            await submit_btn.click()
+        
+        if login_button:
+            await login_button.click()
             console.print("[dim]   🖱️  Giriş butonuna tıklandı[/]")
         else:
-            # Butonu bulamazsa Enter ile dene
+            # Buton bulunamazsa Enter bas
             await page.keyboard.press("Enter")
-            console.print("[dim]   ⌨️  Enter tuşuyla giriş deneniyor[/]")
+            console.print("[dim]   ⌨️  Enter ile giriş denendi[/]")
 
         # ─── Captcha kontrolü ─────────────────────────────────
         console.print(
